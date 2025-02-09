@@ -1,11 +1,13 @@
 use eframe::egui;
 use reqwest;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use confy;
 use egui::Id;
+// For persistent configuration
 
 /// Represents one replay item as returned by the API.
 #[derive(Debug, Deserialize, Clone)]
@@ -25,9 +27,9 @@ struct Replay {
     modcount: u64,
 }
 
-/// Settings that control the server address, refresh interval,
-/// auto‑refresh and auto‑download functionality.
-#[derive(Clone)]
+/// Settings that control the server address, refresh interval, auto‑refresh,
+/// and auto‑download functionality. These settings are persisted using confy.
+#[derive(Clone, Serialize, Deserialize)]
 struct Settings {
     server_addr: String,
     refresh_interval: u64, // seconds
@@ -38,9 +40,9 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            server_addr: "http://addr".to_owned(),
-            refresh_interval: 10,
-            auto_refresh: true,
+            server_addr: "http://server:3000".to_owned(),
+            refresh_interval: 1200,
+            auto_refresh: false,
             auto_download_filter: String::new(),
         }
     }
@@ -67,11 +69,11 @@ struct MyApp {
     list_rx: mpsc::Receiver<Vec<Replay>>,
     /// Sender for updated replay lists (used for manual refresh).
     list_tx: mpsc::Sender<Vec<Replay>>,
-    /// Shared settings.
+    /// Shared settings (persisted via confy).
     settings: Arc<Mutex<Settings>>,
     /// Currently active page.
     current_page: Page,
-    /// Filter text for user id (manual filtering on the Replays page).
+    /// Filter text for user id.
     filter_user: String,
     /// Filter text for workshop mods.
     filter_workshop_mods: String,
@@ -91,19 +93,20 @@ struct MyApp {
 
 impl MyApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        // Create shared settings.
-        let settings = Arc::new(Mutex::new(Settings::default()));
+        // Load settings from disk using confy (or use defaults).
+        let loaded_settings: Settings = confy::load("replay_viewer", None).unwrap_or_default();
+        let settings = Arc::new(Mutex::new(loaded_settings));
         let settings_clone = settings.clone();
 
         // Create a channel for the background thread to send replay lists.
         let (list_tx, list_rx) = mpsc::channel();
-        // Clone the sender for the background thread.
+        // Clone the sender for use in the background thread.
         let list_tx_for_thread = list_tx.clone();
 
         // Create a channel for download events.
         let (download_tx, download_rx) = mpsc::channel();
 
-        // Spawn a background thread to auto‑refresh the replay list if enabled.
+        // Spawn a background thread to auto‑refresh the replay list (if enabled).
         thread::spawn(move || {
             let client = reqwest::blocking::Client::new();
             loop {
@@ -139,7 +142,7 @@ impl MyApp {
         Self {
             replays: Vec::new(),
             list_rx,
-            list_tx, // this is still available for manual refresh
+            list_tx, // used for manual refresh as well
             settings,
             current_page: Page::Replays,
             filter_user: String::new(),
@@ -156,7 +159,7 @@ impl MyApp {
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // When a download is in progress, check if it has completed.
+        // If a download is in progress, check if it has completed.
         if self.is_downloading {
             if let Ok(result) = self.download_rx.try_recv() {
                 self.is_downloading = false;
@@ -206,7 +209,7 @@ impl eframe::App for MyApp {
             self.replays = new_replays;
         }
 
-        // Top navigation.
+        // Top navigation menu.
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui
@@ -248,7 +251,7 @@ impl eframe::App for MyApp {
                 }
                 ui.separator();
 
-                // Manual filter fields.
+                // Filter fields.
                 ui.horizontal(|ui| {
                     ui.label("Filter by user id:");
                     ui.text_edit_singleline(&mut self.filter_user);
@@ -263,7 +266,7 @@ impl eframe::App for MyApp {
                 });
                 ui.separator();
 
-                // Sort replays so that the newest (lowest secondsSince) are first.
+                // Sort replays (newest first: lowest secondsSince).
                 let mut sorted_replays = self.replays.clone();
                 sorted_replays.sort_by_key(|r| r.secondsSince);
 
@@ -296,7 +299,7 @@ impl eframe::App for MyApp {
                                     .clicked()
                                 {
                                     self.is_downloading = true;
-                                    // Mark this replay as downloaded (so it isn’t auto‑downloaded later).
+                                    // Mark replay as downloaded to avoid duplicate auto‑download.
                                     self.downloaded_replays.insert(replay._id.clone());
                                     let replay_id = replay._id.clone();
                                     let server_addr = {
@@ -343,7 +346,7 @@ impl eframe::App for MyApp {
                     }
                 });
 
-                // Auto‑download: If an auto‑download filter is set, check for matching replays.
+                // Auto‑download: If an auto‑download filter is set, trigger auto‑download for matching replays.
                 if !self.is_downloading {
                     let auto_filter = {
                         let s = self.settings.lock().unwrap();
@@ -405,11 +408,11 @@ impl eframe::App for MyApp {
                     ui.add_space(10.0);
                     ui.label("Refresh Interval (seconds):");
                     ui.add(
-                        egui::Slider::new(&mut settings.refresh_interval, 1..=60)
+                        egui::Slider::new(&mut settings.refresh_interval, 1..=86400)
                             .text("seconds"),
                     );
                     ui.add_space(10.0);
-                    // Button to toggle auto-refresh.
+                    // Toggle auto‑refresh.
                     if settings.auto_refresh {
                         if ui.button("Stop Refreshes").clicked() {
                             settings.auto_refresh = false;
@@ -422,6 +425,17 @@ impl eframe::App for MyApp {
                     ui.add_space(10.0);
                     ui.label("Auto Download Filter (download replay if matched):");
                     ui.text_edit_singleline(&mut settings.auto_download_filter);
+                    ui.add_space(10.0);
+                    // Offload saving settings to a background thread to avoid UI freeze.
+                    if ui.button("Save Settings").clicked() {
+                        let settings_clone = settings.clone();
+                        thread::spawn(move || {
+                            match confy::store("replay_viewer", None, &settings_clone) {
+                                Ok(_) => println!("Settings saved."),
+                                Err(err) => eprintln!("Error saving settings: {:?}", err),
+                            }
+                        });
+                    }
                 } else {
                     ui.label("Error accessing settings");
                 }
