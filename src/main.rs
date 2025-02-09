@@ -1,4 +1,3 @@
-#![windows_subsystem = "windows"]
 use eframe::egui;
 use reqwest;
 use serde::{Deserialize, Serialize};
@@ -171,11 +170,7 @@ impl eframe::App for MyApp {
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
                         let rect = ctx.input(|i| i.screen_rect());
-                        ui.painter().rect_filled(
-                            rect,
-                            0.0,
-                            egui::Color32::from_black_alpha(150),
-                        );
+                        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(150));
                         ui.allocate_ui(rect.size(), |ui| {
                             ui.vertical_centered(|ui| {
                                 ui.add(egui::Spinner::new());
@@ -309,9 +304,14 @@ impl eframe::App for MyApp {
                                     };
                                     let download_tx = self.download_tx.clone();
                                     thread::spawn(move || {
+                                        // Build a client with no timeout.
+                                        let client = reqwest::blocking::Client::builder()
+                                            .timeout(None)
+                                            .build()
+                                            .expect("Failed to build client");
                                         let download_url =
                                             format!("{}/download/{}", server_addr, replay_id);
-                                        match reqwest::blocking::get(&download_url) {
+                                        match client.get(&download_url).send() {
                                             Ok(resp) => {
                                                 if resp.status().is_success() {
                                                     let _ = download_tx.send(DownloadResult::Success(
@@ -369,9 +369,13 @@ impl eframe::App for MyApp {
                                 };
                                 let download_tx = self.download_tx.clone();
                                 thread::spawn(move || {
+                                    let client = reqwest::blocking::Client::builder()
+                                        .timeout(None)
+                                        .build()
+                                        .expect("Failed to build client");
                                     let download_url =
                                         format!("{}/download/{}", server_addr, replay_id);
-                                    match reqwest::blocking::get(&download_url) {
+                                    match client.get(&download_url).send() {
                                         Ok(resp) => {
                                             if resp.status().is_success() {
                                                 let _ = download_tx.send(DownloadResult::Success(
@@ -394,7 +398,7 @@ impl eframe::App for MyApp {
                                         }
                                     }
                                 });
-                                break; // Trigger one auto-download at a time.
+                                break; // Only trigger one auto-download at a time.
                             }
                         }
                     }
