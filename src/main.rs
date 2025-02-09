@@ -229,11 +229,11 @@ impl eframe::App for MyApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.current_page {
             Page::Replays => {
-                ui.heading("Replay Viewer");
+                ui.heading("LocalPavTV_GUI");
                 ui.separator();
 
                 // Manual Refresh Button.
-                if ui.button("Manual Refresh").clicked() {
+                if ui.button("Refresh").clicked() {
                     let server_addr = {
                         let s = self.settings.lock().unwrap();
                         s.server_addr.clone()
@@ -414,11 +414,11 @@ impl eframe::App for MyApp {
                     ui.add_space(10.0);
                     // Toggle auto‑refresh.
                     if settings.auto_refresh {
-                        if ui.button("Stop Refreshes").clicked() {
+                        if ui.button("Stop Auto Refresh").clicked() {
                             settings.auto_refresh = false;
                         }
                     } else {
-                        if ui.button("Start Refreshes").clicked() {
+                        if ui.button("Start Auto Refresh").clicked() {
                             settings.auto_refresh = true;
                         }
                     }
@@ -449,7 +449,7 @@ impl eframe::App for MyApp {
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
-        "Replay Viewer",
+        "LocalPavTV_GUI",
         options,
         Box::new(|cc| Ok(Box::new(MyApp::new(cc)))),
     )

@@ -1,0 +1,30 @@
+name: Build Windows Prod Binary
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Upload Release Binary Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: LocalPavTV_GUI_windows
+          path: target/release/LocalPavTV_GUI.exe
