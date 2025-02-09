@@ -1,4 +1,4 @@
-name: Build Windows Prod Binary
+name: Build Windows Production Binary
 
 on:
   push:
@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Setup Rust toolchain
         uses: actions-rs/toolchain@v1
@@ -24,7 +24,7 @@ jobs:
         run: cargo build --release
 
       - name: Upload Release Binary Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: LocalPavTV_GUI_windows
-          path: target/release/LocalPavTV_GUI.exe
+          name: localpavtv_gui_windows
+          path: target/release/localpavtv_gui.exe

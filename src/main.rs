@@ -94,7 +94,7 @@ struct MyApp {
 impl MyApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         // Load settings from disk using confy (or use defaults).
-        let loaded_settings: Settings = confy::load("replay_viewer", None).unwrap_or_default();
+        let loaded_settings: Settings = confy::load("localpavtv_gui", None).unwrap_or_default();
         let settings = Arc::new(Mutex::new(loaded_settings));
         let settings_clone = settings.clone();
 
@@ -430,7 +430,7 @@ impl eframe::App for MyApp {
                     if ui.button("Save Settings").clicked() {
                         let settings_clone = settings.clone();
                         thread::spawn(move || {
-                            match confy::store("replay_viewer", None, &settings_clone) {
+                            match confy::store("localpavtv_gui", None, &settings_clone) {
                                 Ok(_) => println!("Settings saved."),
                                 Err(err) => eprintln!("Error saving settings: {:?}", err),
                             }
