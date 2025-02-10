@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 use eframe::egui;
 use reqwest;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,7 @@ use confy;
 use egui::Id;
 // For persistent configuration
 use image; // For decoding PNG avatar images
+
 
 /// Represents one replay item as returned by the API.
 #[derive(Debug, Deserialize, Clone)]
