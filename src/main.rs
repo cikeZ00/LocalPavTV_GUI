@@ -1,13 +1,14 @@
 use eframe::egui;
 use reqwest;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use confy;
 use egui::Id;
 // For persistent configuration
+use image; // For decoding PNG avatar images
 
 /// Represents one replay item as returned by the API.
 #[derive(Debug, Deserialize, Clone)]
@@ -73,11 +74,11 @@ struct MyApp {
     settings: Arc<Mutex<Settings>>,
     /// Currently active page.
     current_page: Page,
-    /// Filter text for user id.
+    /// Manual filter for user id.
     filter_user: String,
-    /// Filter text for workshop mods.
+    /// Manual filter for workshop mods.
     filter_workshop_mods: String,
-    /// Filter text for workshop id.
+    /// Manual filter for workshop id.
     filter_workshop_id: String,
     // Download state:
     /// True while waiting for a download API call to return.
@@ -89,6 +90,14 @@ struct MyApp {
     download_rx: mpsc::Receiver<DownloadResult>,
     /// Keeps track of replay IDs that have been auto‑downloaded.
     downloaded_replays: HashSet<String>,
+    /// --- Fields for loading user avatars ---
+    /// A channel to receive (user, image) pairs after downloading avatars.
+    profile_tx: mpsc::Sender<(String, egui::ColorImage)>,
+    profile_rx: mpsc::Receiver<(String, egui::ColorImage)>,
+    /// A cache mapping user id to a loaded texture.
+    profile_textures: HashMap<String, egui::TextureHandle>,
+    /// Track which user IDs are currently being loaded.
+    loading_profiles: HashSet<String>,
 }
 
 impl MyApp {
@@ -98,13 +107,16 @@ impl MyApp {
         let settings = Arc::new(Mutex::new(loaded_settings));
         let settings_clone = settings.clone();
 
-        // Create a channel for the background thread to send replay lists.
+        // Create a channel for replay list updates.
         let (list_tx, list_rx) = mpsc::channel();
         // Clone the sender for use in the background thread.
         let list_tx_for_thread = list_tx.clone();
 
         // Create a channel for download events.
         let (download_tx, download_rx) = mpsc::channel();
+
+        // Create a channel for profile image updates.
+        let (profile_tx, profile_rx) = mpsc::channel();
 
         // Spawn a background thread to auto‑refresh the replay list (if enabled).
         thread::spawn(move || {
@@ -153,12 +165,33 @@ impl MyApp {
             download_tx,
             download_rx,
             downloaded_replays: HashSet::new(),
+            profile_tx,
+            profile_rx,
+            profile_textures: HashMap::new(),
+            loading_profiles: HashSet::new(),
         }
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process any loaded profile images received from background threads.
+        while let Ok((user, color_image)) = self.profile_rx.try_recv() {
+            let texture_handle = ctx.load_texture(
+                &format!("avatar_{}", user),
+                color_image,
+                egui::TextureOptions {
+                    magnification: egui::TextureFilter::Linear,
+                    minification: egui::TextureFilter::Linear,
+                    ..Default::default()
+                },
+            );
+
+            self.profile_textures.insert(user.clone(), texture_handle);
+            // Remove the user from the "loading" set.
+            self.loading_profiles.remove(&user);
+        }
+
         // If a download is in progress, check if it has completed.
         if self.is_downloading {
             if let Ok(result) = self.download_rx.try_recv() {
@@ -288,10 +321,7 @@ impl eframe::App for MyApp {
                                 ui.label(format!("Friendly Name: {}", replay.friendlyName));
                                 // Bigger, square download button.
                                 if ui
-                                    .add_sized(
-                                        egui::vec2(60.0, 60.0),
-                                        egui::Button::new("Download"),
-                                    )
+                                    .add_sized(egui::vec2(160.0, 60.0), egui::Button::new("Download"))
                                     .clicked()
                                 {
                                     self.is_downloading = true;
@@ -336,7 +366,61 @@ impl eframe::App for MyApp {
                                     });
                                 }
                             });
-                            ui.label(format!("Users: {:?}", replay.users));
+                            // Instead of listing user IDs as text, display their avatar images.
+                            ui.horizontal(|ui| {
+                                for user in &replay.users {
+                                    // If we already loaded the avatar, show it.
+                                    if let Some(texture) = self.profile_textures.get(user) {
+                                        if ui
+                                            .add_sized(egui::vec2(64.0, 64.0), egui::ImageButton::new(texture))
+                                            .clicked()
+                                        {
+                                            ctx.output_mut(|output| {
+                                                output.copied_text = user.clone();
+                                            });
+
+                                        }
+
+                                    } else {
+                                        // Otherwise, show a placeholder button.
+                                        if ui.add_sized([64.0, 64.0], egui::Button::new("Loading")).clicked() {
+                                            ctx.output_mut(|output| {
+                                                output.copied_text = user.clone();
+                                            });
+
+                                        }
+                                        // If not already loading, spawn a thread to fetch the avatar.
+                                        if !self.loading_profiles.contains(user) {
+                                            self.loading_profiles.insert(user.clone());
+                                            let user_clone = user.clone();
+                                            let profile_tx = self.profile_tx.clone();
+                                            thread::spawn(move || {
+                                                let client = reqwest::blocking::Client::builder()
+                                                    .timeout(None)
+                                                    .build()
+                                                    .expect("Failed to build client");
+                                                let url = format!("http://prod.cdn.pavlov-vr.com/avatar/{}.png", user_clone);
+                                                match client.get(&url).send() {
+                                                    Ok(resp) => {
+                                                        if let Ok(bytes) = resp.bytes() {
+                                                            if let Ok(img) = image::load_from_memory(&bytes) {
+                                                                let img = img.to_rgba8();
+                                                                let size = [img.width() as usize, img.height() as usize];
+                                                                let pixels = img.into_raw();
+                                                                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                                                                let _ = profile_tx.send((user_clone, color_image));
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(err) => {
+                                                        eprintln!("Error loading avatar for {}: {}", user_clone, err);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                            });
                             ui.label(format!("Workshop Mods: {}", replay.workshop_mods));
                             ui.label(format!("Game Mode: {}", replay.gameMode));
                             ui.label(format!("Mod Count: {}", replay.modcount));
