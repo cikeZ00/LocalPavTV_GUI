@@ -1,4 +1,3 @@
-#![windows_subsystem = "windows"]
 use eframe::egui;
 use reqwest;
 use serde::{Deserialize, Serialize};
@@ -10,7 +9,6 @@ use confy;
 use egui::Id;
 // For persistent configuration
 use image; // For decoding PNG avatar images
-
 
 /// Represents one replay item as returned by the API.
 #[derive(Debug, Deserialize, Clone)]
@@ -100,6 +98,12 @@ struct MyApp {
     profile_textures: HashMap<String, egui::TextureHandle>,
     /// Track which user IDs are currently being loaded.
     loading_profiles: HashSet<String>,
+    /// --- New channels and state for checking replay existence ---
+    /// Channel to receive check results: (replay_id, exists, server_addr)
+    check_tx: mpsc::Sender<(String, bool, String)>,
+    check_rx: mpsc::Receiver<(String, bool, String)>,
+    /// If a manual download check indicates the replay exists, this holds (replay_id, server_addr)
+    download_prompt: Option<(String, String)>,
 }
 
 impl MyApp {
@@ -109,9 +113,8 @@ impl MyApp {
         let settings = Arc::new(Mutex::new(loaded_settings));
         let settings_clone = settings.clone();
 
-        // Create a channel for replay list updates.
+        // Create a channel for the background thread to send replay lists.
         let (list_tx, list_rx) = mpsc::channel();
-        // Clone the sender for use in the background thread.
         let list_tx_for_thread = list_tx.clone();
 
         // Create a channel for download events.
@@ -119,6 +122,9 @@ impl MyApp {
 
         // Create a channel for profile image updates.
         let (profile_tx, profile_rx) = mpsc::channel();
+
+        // Create a channel for check responses.
+        let (check_tx, check_rx) = mpsc::channel();
 
         // Spawn a background thread to auto‑refresh the replay list (if enabled).
         thread::spawn(move || {
@@ -156,7 +162,7 @@ impl MyApp {
         Self {
             replays: Vec::new(),
             list_rx,
-            list_tx, // used for manual refresh as well
+            list_tx,
             settings,
             current_page: Page::Replays,
             filter_user: String::new(),
@@ -171,12 +177,89 @@ impl MyApp {
             profile_rx,
             profile_textures: HashMap::new(),
             loading_profiles: HashSet::new(),
+            check_tx,
+            check_rx,
+            download_prompt: None,
         }
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process any check responses from background threads.
+        while let Ok((replay_id, exists, server_addr)) = self.check_rx.try_recv() {
+            if exists {
+                // The replay already exists on the server.
+                self.download_prompt = Some((replay_id, server_addr));
+                self.is_downloading = false; // stop the loading overlay
+            } else {
+                // Replay does not exist; proceed with download immediately.
+                let download_tx = self.download_tx.clone();
+                let server_addr_clone = server_addr.clone();
+                let replay_id_clone = replay_id.clone();
+                thread::spawn(move || {
+                    let client = reqwest::blocking::Client::builder()
+                        .timeout(None)
+                        .build()
+                        .expect("Failed to build client");
+                    let download_url = format!("{}/download/{}", server_addr_clone, replay_id_clone);
+                    match client.get(&download_url).send() {
+                        Ok(resp) => {
+                            if resp.status().is_success() {
+                                let _ = download_tx.send(DownloadResult::Success(format!("Downloaded replay {}", replay_id_clone)));
+                            } else {
+                                let _ = download_tx.send(DownloadResult::Failure(format!("Failed to download replay {}: HTTP {}", replay_id_clone, resp.status())));
+                            }
+                        }
+                        Err(err) => {
+                            let _ = download_tx.send(DownloadResult::Failure(format!("Error downloading {}: {}", replay_id_clone, err)));
+                        }
+                    }
+                });
+            }
+        }
+
+        // If a download prompt is pending, show a modal window.
+        if let Some((replay_id, server_addr)) = self.download_prompt.clone() {
+            egui::Window::new("Replay Already Exists")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("This replay already exists on the server. Download again?");
+                    if ui.button("Yes").clicked() {
+                        let download_tx = self.download_tx.clone();
+                        let server_addr_clone = server_addr.clone();
+                        let replay_id_clone = replay_id.clone();
+                        thread::spawn(move || {
+                            let client = reqwest::blocking::Client::builder()
+                                .timeout(None)
+                                .build()
+                                .expect("Failed to build client");
+                            let download_url = format!("{}/download/{}", server_addr_clone, replay_id_clone);
+                            match client.get(&download_url).send() {
+                                Ok(resp) => {
+                                    if resp.status().is_success() {
+                                        let _ = download_tx.send(DownloadResult::Success(format!("Downloaded replay {}", replay_id_clone)));
+                                    } else {
+                                        let _ = download_tx.send(DownloadResult::Failure(format!("Failed to download replay {}: HTTP {}", replay_id_clone, resp.status())));
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = download_tx.send(DownloadResult::Failure(format!("Error downloading {}: {}", replay_id_clone, err)));
+                                }
+                            }
+                        });
+                        self.download_prompt = None;
+                        self.is_downloading = true;
+                    }
+                    if ui.button("No").clicked() {
+                        self.download_prompt = None;
+                        self.is_downloading = false;
+                    }
+                });
+        }
+
         // Process any loaded profile images received from background threads.
         while let Ok((user, color_image)) = self.profile_rx.try_recv() {
             let texture_handle = ctx.load_texture(
@@ -188,19 +271,16 @@ impl eframe::App for MyApp {
                     ..Default::default()
                 },
             );
-
             self.profile_textures.insert(user.clone(), texture_handle);
-            // Remove the user from the "loading" set.
             self.loading_profiles.remove(&user);
         }
 
-        // If a download is in progress, check if it has completed.
+        // If a download (manual or auto) is in progress, check for its result.
         if self.is_downloading {
             if let Ok(result) = self.download_rx.try_recv() {
                 self.is_downloading = false;
                 self.download_result = Some(result);
             } else {
-                // Show a loading overlay while downloading.
                 egui::Area::new(Id::from("loading_overlay"))
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
@@ -321,57 +401,46 @@ impl eframe::App for MyApp {
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
                                 ui.label(format!("Friendly Name: {}", replay.friendlyName));
-                                // Bigger, square download button.
+                                // Manual Download Button:
+                                // Instead of downloading immediately, first check if the replay exists.
                                 if ui
-                                    .add_sized(egui::vec2(160.0, 60.0), egui::Button::new("Download"))
+                                    .add_sized(egui::vec2(60.0, 60.0), egui::Button::new("Download"))
                                     .clicked()
                                 {
                                     self.is_downloading = true;
-                                    // Mark replay as downloaded to avoid duplicate auto‑download.
+                                    // Mark this replay as downloaded to avoid duplicate auto‑download.
                                     self.downloaded_replays.insert(replay._id.clone());
                                     let replay_id = replay._id.clone();
                                     let server_addr = {
                                         let s = self.settings.lock().unwrap();
                                         s.server_addr.clone()
                                     };
-                                    let download_tx = self.download_tx.clone();
+                                    let check_tx = self.check_tx.clone();
                                     thread::spawn(move || {
-                                        // Build a client with no timeout.
                                         let client = reqwest::blocking::Client::builder()
                                             .timeout(None)
                                             .build()
                                             .expect("Failed to build client");
-                                        let download_url =
-                                            format!("{}/download/{}", server_addr, replay_id);
-                                        match client.get(&download_url).send() {
+                                        let check_url = format!("{}/check/{}", server_addr, replay_id);
+                                        match client.get(&check_url).send() {
                                             Ok(resp) => {
-                                                if resp.status().is_success() {
-                                                    let _ = download_tx.send(DownloadResult::Success(
-                                                        format!("Downloaded replay {}", replay_id),
-                                                    ));
-                                                } else {
-                                                    let _ = download_tx.send(DownloadResult::Failure(
-                                                        format!(
-                                                            "Failed to download replay {}: HTTP {}",
-                                                            replay_id,
-                                                            resp.status()
-                                                        ),
-                                                    ));
+                                                if let Ok(text) = resp.text() {
+                                                    let exists = text.trim() == "true";
+                                                    let _ = check_tx.send((replay_id, exists, server_addr));
                                                 }
                                             }
                                             Err(err) => {
-                                                let _ = download_tx.send(DownloadResult::Failure(
-                                                    format!("Error downloading {}: {}", replay_id, err),
-                                                ));
+                                                eprintln!("Error checking replay {}: {}", replay_id, err);
+                                                // On error, assume it does not exist.
+                                                let _ = check_tx.send((replay_id, false, server_addr));
                                             }
                                         }
                                     });
                                 }
                             });
-                            // Instead of listing user IDs as text, display their avatar images.
+                            // Display avatars instead of user IDs.
                             ui.horizontal(|ui| {
                                 for user in &replay.users {
-                                    // If we already loaded the avatar, show it.
                                     if let Some(texture) = self.profile_textures.get(user) {
                                         if ui
                                             .add_sized(egui::vec2(64.0, 64.0), egui::ImageButton::new(texture))
@@ -380,18 +449,13 @@ impl eframe::App for MyApp {
                                             ctx.output_mut(|output| {
                                                 output.copied_text = user.clone();
                                             });
-
                                         }
-
                                     } else {
-                                        // Otherwise, show a placeholder button.
-                                        if ui.add_sized([64.0, 64.0], egui::Button::new("Loading")).clicked() {
+                                        if ui.add_sized(egui::vec2(64.0, 64.0), egui::Button::new("Loading")).clicked() {
                                             ctx.output_mut(|output| {
                                                 output.copied_text = user.clone();
                                             });
-
                                         }
-                                        // If not already loading, spawn a thread to fetch the avatar.
                                         if !self.loading_profiles.contains(user) {
                                             self.loading_profiles.insert(user.clone());
                                             let user_clone = user.clone();
@@ -433,7 +497,7 @@ impl eframe::App for MyApp {
                     }
                 });
 
-                // Auto‑download: If an auto‑download filter is set, trigger auto‑download for matching replays.
+                // Auto‑download: (unchanged; auto‑download logic continues as before)
                 if !self.is_downloading {
                     let auto_filter = {
                         let s = self.settings.lock().unwrap();
@@ -459,32 +523,21 @@ impl eframe::App for MyApp {
                                         .timeout(None)
                                         .build()
                                         .expect("Failed to build client");
-                                    let download_url =
-                                        format!("{}/download/{}", server_addr, replay_id);
+                                    let download_url = format!("{}/download/{}", server_addr, replay_id);
                                     match client.get(&download_url).send() {
                                         Ok(resp) => {
                                             if resp.status().is_success() {
-                                                let _ = download_tx.send(DownloadResult::Success(
-                                                    format!("Auto-downloaded replay {}", replay_id),
-                                                ));
+                                                let _ = download_tx.send(DownloadResult::Success(format!("Auto-downloaded replay {}", replay_id)));
                                             } else {
-                                                let _ = download_tx.send(DownloadResult::Failure(
-                                                    format!(
-                                                        "Failed auto-download of replay {}: HTTP {}",
-                                                        replay_id,
-                                                        resp.status()
-                                                    ),
-                                                ));
+                                                let _ = download_tx.send(DownloadResult::Failure(format!("Failed auto-download of replay {}: HTTP {}", replay_id, resp.status())));
                                             }
                                         }
                                         Err(err) => {
-                                            let _ = download_tx.send(DownloadResult::Failure(
-                                                format!("Error auto-downloading {}: {}", replay_id, err),
-                                            ));
+                                            let _ = download_tx.send(DownloadResult::Failure(format!("Error auto-downloading {}: {}", replay_id, err)));
                                         }
                                     }
                                 });
-                                break; // Only trigger one auto-download at a time.
+                                break;
                             }
                         }
                     }
@@ -503,7 +556,6 @@ impl eframe::App for MyApp {
                             .text("seconds"),
                     );
                     ui.add_space(10.0);
-                    // Toggle auto‑refresh.
                     if settings.auto_refresh {
                         if ui.button("Stop Auto Refresh").clicked() {
                             settings.auto_refresh = false;
@@ -517,7 +569,6 @@ impl eframe::App for MyApp {
                     ui.label("Auto Download Filter (download replay if matched):");
                     ui.text_edit_singleline(&mut settings.auto_download_filter);
                     ui.add_space(10.0);
-                    // Offload saving settings to a background thread to avoid UI freeze.
                     if ui.button("Save Settings").clicked() {
                         let settings_clone = settings.clone();
                         thread::spawn(move || {
@@ -540,7 +591,7 @@ impl eframe::App for MyApp {
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
-        "LocalPavTV_GUI",
+        "LocalPavTV",
         options,
         Box::new(|cc| Ok(Box::new(MyApp::new(cc)))),
     )
