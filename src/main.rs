@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 use eframe::egui;
 use reqwest;
 use serde::{Deserialize, Serialize};
