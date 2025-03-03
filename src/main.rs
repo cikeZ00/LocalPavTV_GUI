@@ -21,9 +21,9 @@ struct Replay {
     competitive: bool,
     gameMode: String,
     created: String,
+    expires: String,
     live: bool,
     friendlyName: String,
-    totalByes: u64,
     users: Vec<String>,
     secondsSince: u64,
     modcount: u64,
@@ -489,16 +489,17 @@ impl eframe::App for MyApp {
                                 }
                             });
                             ui.label(format!("Workshop Mods: {}", replay.workshop_mods));
+                            ui.label(format!("Workshop ID: {}", replay.workshop_id));
                             ui.label(format!("Game Mode: {}", replay.gameMode));
                             ui.label(format!("Mod Count: {}", replay.modcount));
                             ui.label(format!("Seconds Since: {}", replay.secondsSince));
-                            ui.label(format!("Workshop ID: {}", replay.workshop_id));
+                            ui.label(format!("Expires: {}", replay.expires));
                         });
                         ui.add_space(10.0);
                     }
                 });
 
-                // Auto‑download: (unchanged; auto‑download logic continues as before)
+                // Auto‑download
                 if !self.is_downloading {
                     let auto_filter = {
                         let s = self.settings.lock().unwrap();
