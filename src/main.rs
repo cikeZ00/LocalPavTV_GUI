@@ -1,4 +1,5 @@
 #![windows_subsystem = "windows"]
+
 use eframe::egui;
 use reqwest;
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,6 @@ use std::thread;
 use std::time::Duration;
 use confy;
 use egui::Id;
-// For persistent configuration
 use image; // For decoding PNG avatar images
 
 /// Represents one replay item as returned by the API.
@@ -29,8 +29,14 @@ struct Replay {
     modcount: u64,
 }
 
-/// Settings that control the server address, refresh interval, auto‑refresh,
-/// and auto‑download functionality. These settings are persisted using confy.
+/// The response from the /list endpoint.
+#[derive(Debug, Deserialize, Clone)]
+struct ListResponse {
+    replays: Vec<Replay>,
+    total: usize,
+}
+
+/// Settings persisted via confy.
 #[derive(Clone, Serialize, Deserialize)]
 struct Settings {
     server_addr: String,
@@ -67,14 +73,18 @@ enum DownloadResult {
 struct MyApp {
     /// Latest replay list from the server.
     replays: Vec<Replay>,
+    /// Total number of replays (from the API).
+    total: usize,
     /// Receiver for updated replay lists.
-    list_rx: mpsc::Receiver<Vec<Replay>>,
+    list_rx: mpsc::Receiver<ListResponse>,
     /// Sender for updated replay lists (used for manual refresh).
-    list_tx: mpsc::Sender<Vec<Replay>>,
+    list_tx: mpsc::Sender<ListResponse>,
     /// Shared settings (persisted via confy).
     settings: Arc<Mutex<Settings>>,
-    /// Currently active page.
-    current_page: Page,
+    /// Current page number.
+    current_page: Arc<Mutex<usize>>,
+    /// Currently active UI page.
+    current_ui_page: Page,
     /// Manual filter for user id.
     filter_user: String,
     /// Manual filter for workshop mods.
@@ -118,16 +128,16 @@ impl MyApp {
         let (list_tx, list_rx) = mpsc::channel();
         let list_tx_for_thread = list_tx.clone();
 
-        // Create a channel for download events.
+        // Create channels for download events, profile images, and check responses.
         let (download_tx, download_rx) = mpsc::channel();
-
-        // Create a channel for profile image updates.
         let (profile_tx, profile_rx) = mpsc::channel();
-
-        // Create a channel for check responses.
         let (check_tx, check_rx) = mpsc::channel();
 
-        // Spawn a background thread to auto‑refresh the replay list (if enabled).
+        // current_page starts at 0 (first page)
+        let current_page = Arc::new(Mutex::new(0));
+        let current_page_clone = current_page.clone();
+
+        // Auto‑refresh thread: it will use the current page value to calculate the offset.
         thread::spawn(move || {
             let client = reqwest::blocking::Client::new();
             loop {
@@ -140,13 +150,12 @@ impl MyApp {
                     )
                 };
                 if auto_refresh {
-                    let list_url = format!("{}/list", server_addr);
+                    let offset = { *current_page_clone.lock().unwrap() } * 100;
+                    let list_url = format!("{}/list?offset={}", server_addr, offset);
                     match client.get(&list_url).send() {
                         Ok(response) => {
-                            if let Ok(replays) = response.json::<Vec<Replay>>() {
-                                if list_tx_for_thread.send(replays).is_err() {
-                                    break;
-                                }
+                            if let Ok(list_response) = response.json::<ListResponse>() {
+                                let _ = list_tx_for_thread.send(list_response);
                             } else {
                                 eprintln!("Error parsing JSON from {}", list_url);
                             }
@@ -162,10 +171,12 @@ impl MyApp {
 
         Self {
             replays: Vec::new(),
+            total: 0,
             list_rx,
             list_tx,
             settings,
-            current_page: Page::Replays,
+            current_page,
+            current_ui_page: Page::Replays,
             filter_user: String::new(),
             filter_workshop_mods: String::new(),
             filter_workshop_id: String::new(),
@@ -182,6 +193,26 @@ impl MyApp {
             check_rx,
             download_prompt: None,
         }
+    }
+
+    // Helper function to fetch replays for the current page manually.
+    fn fetch_replays(&self) {
+        let server_addr = {
+            let s = self.settings.lock().unwrap();
+            s.server_addr.clone()
+        };
+        let current_page = { *self.current_page.lock().unwrap() };
+        let offset = current_page * 100;
+        let list_tx = self.list_tx.clone();
+        thread::spawn(move || {
+            let client = reqwest::blocking::Client::new();
+            let list_url = format!("{}/list?offset={}", server_addr, offset);
+            if let Ok(response) = client.get(&list_url).send() {
+                if let Ok(list_response) = response.json::<ListResponse>() {
+                    let _ = list_tx.send(list_response);
+                }
+            }
+        });
     }
 }
 
@@ -317,49 +348,32 @@ impl eframe::App for MyApp {
         }
 
         // Process new replay lists (from auto‑refresh or manual refresh).
-        while let Ok(new_replays) = self.list_rx.try_recv() {
-            self.replays = new_replays;
+        while let Ok(list_response) = self.list_rx.try_recv() {
+            self.replays = list_response.replays;
+            self.total = list_response.total;
         }
 
         // Top navigation menu.
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(matches!(self.current_page, Page::Replays), "Replays")
-                    .clicked()
-                {
-                    self.current_page = Page::Replays;
+                if ui.selectable_label(matches!(self.current_ui_page, Page::Replays), "Replays").clicked() {
+                    self.current_ui_page = Page::Replays;
                 }
-                if ui
-                    .selectable_label(matches!(self.current_page, Page::Settings), "Settings")
-                    .clicked()
-                {
-                    self.current_page = Page::Settings;
+                if ui.selectable_label(matches!(self.current_ui_page, Page::Settings), "Settings").clicked() {
+                    self.current_ui_page = Page::Settings;
                 }
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.current_page {
+        egui::CentralPanel::default().show(ctx, |ui| match self.current_ui_page {
             Page::Replays => {
                 ui.heading("LocalPavTV_GUI");
+                ui.label(format!("Total replays: {}", self.total));
                 ui.separator();
 
                 // Manual Refresh Button.
                 if ui.button("Refresh").clicked() {
-                    let server_addr = {
-                        let s = self.settings.lock().unwrap();
-                        s.server_addr.clone()
-                    };
-                    let list_tx = self.list_tx.clone();
-                    thread::spawn(move || {
-                        let client = reqwest::blocking::Client::new();
-                        let list_url = format!("{}/list", server_addr);
-                        if let Ok(response) = client.get(&list_url).send() {
-                            if let Ok(replays) = response.json::<Vec<Replay>>() {
-                                let _ = list_tx.send(replays);
-                            }
-                        }
-                    });
+                    self.fetch_replays();
                 }
                 ui.separator();
 
@@ -553,10 +567,7 @@ impl eframe::App for MyApp {
                     ui.text_edit_singleline(&mut settings.server_addr);
                     ui.add_space(10.0);
                     ui.label("Refresh Interval (seconds):");
-                    ui.add(
-                        egui::Slider::new(&mut settings.refresh_interval, 1..=86400)
-                            .text("seconds"),
-                    );
+                    ui.add(egui::Slider::new(&mut settings.refresh_interval, 1..=86400).text("seconds"));
                     ui.add_space(10.0);
                     if settings.auto_refresh {
                         if ui.button("Stop Auto Refresh").clicked() {
@@ -585,6 +596,35 @@ impl eframe::App for MyApp {
                 }
             }
         });
+
+        // Paging buttons
+        if let Page::Replays = self.current_ui_page {
+            egui::Area::new(Id::from("page_buttons"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, [-10.0, -10.0])
+                .show(ctx, |ui| {
+                    let total_pages = if self.total == 0 {
+                        1
+                    } else {
+                        ((self.total as f64) / 100.0).ceil() as usize
+                    };
+                    let current_page_val = { *self.current_page.lock().unwrap() };
+                    ui.horizontal(|ui| {
+                        if ui.button("Previous").clicked() {
+                            if current_page_val > 0 {
+                                *self.current_page.lock().unwrap() -= 1;
+                                self.fetch_replays();
+                            }
+                        }
+                        ui.label(format!("Page {} of {}", current_page_val + 1, total_pages));
+                        if ui.button("Next").clicked() {
+                            if current_page_val < total_pages - 1 {
+                                *self.current_page.lock().unwrap() += 1;
+                                self.fetch_replays();
+                            }
+                        }
+                    });
+                });
+        }
 
         ctx.request_repaint_after(Duration::from_millis(100));
     }
